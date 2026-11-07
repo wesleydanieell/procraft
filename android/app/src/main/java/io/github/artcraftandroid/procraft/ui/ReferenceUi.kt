@@ -1,5 +1,7 @@
 package io.github.artcraftandroid.procraft.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -11,7 +13,10 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.Canvas
@@ -46,11 +51,19 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import kotlin.math.roundToInt
 
@@ -172,7 +185,7 @@ private fun ReferenceWindowContent(vm: CanvasViewModel) {
                             }
                         }
                     }
-                    CanvasViewModel.ReferenceMode.FACE -> Text("Not available on this device", color = Muted, fontSize = 14.sp)
+                    CanvasViewModel.ReferenceMode.FACE -> FaceCamera(Modifier.fillMaxSize())
                 }
             }
             // what a bar at [top] (window pixels) has behind it: the window, and the picture blurred
@@ -321,4 +334,71 @@ private suspend fun PointerInputScope.pictureGestures(vm: CanvasViewModel, pictu
             vm.pinchReference(sizes, before, after, if (apartBefore > 0f) apartAfter / apartBefore else 1f)
         }
     }
+}
+
+
+/**
+ * The Face mode's live front camera, the first half of Procreate's FacePaint: the face is there to
+ * pose in front of and paint from. The projection of the artwork onto the face is still to come.
+ * The camera is released with the window; a device without one, or a refused permission, says so.
+ */
+@Composable
+private fun FaceCamera(modifier: Modifier) {
+    val context = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current
+    var allowed by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+    }
+    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed = it }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        if (!allowed) ask.launch(Manifest.permission.CAMERA)
+    }
+    if (!allowed) {
+        Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            Text("Camera access is off", color = Muted, fontSize = 15.sp)
+            Text(
+                "Allow camera",
+                color = Pc.Accent,
+                fontSize = 15.sp,
+                modifier = Modifier.padding(top = 8.dp).clickable { ask.launch(Manifest.permission.CAMERA) }.padding(8.dp),
+            )
+        }
+        return
+    }
+    val provider = remember { ProcessCameraProvider.getInstance(context) }
+    androidx.compose.runtime.DisposableEffect(lifecycle) {
+        onDispose {
+            if (provider.isDone) runCatching { provider.get().unbindAll() }
+        }
+    }
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            PreviewView(ctx).apply {
+                implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                scaleType = PreviewView.ScaleType.FILL_CENTER
+                // a mirror, as a front camera should be
+                scaleX = -1f
+            }
+        },
+        update = { view ->
+            provider.addListener(
+                {
+                    runCatching {
+                        val camera = provider.get()
+                        val preview = Preview.Builder().build().also { it.setSurfaceProvider(view.surfaceProvider) }
+                        val selector =
+                            if (camera.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) {
+                                CameraSelector.DEFAULT_FRONT_CAMERA
+                            } else {
+                                CameraSelector.DEFAULT_BACK_CAMERA
+                            }
+                        camera.unbindAll()
+                        camera.bindToLifecycle(lifecycle, selector, preview)
+                    }
+                },
+                ContextCompat.getMainExecutor(context),
+            )
+        },
+    )
 }
