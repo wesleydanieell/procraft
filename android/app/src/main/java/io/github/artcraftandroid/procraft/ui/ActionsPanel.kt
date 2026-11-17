@@ -921,6 +921,8 @@ private fun PressurePage(vm: CanvasViewModel, onBack: () -> Unit) {
         Group(listOf(Toggle("Tip Attachment", vm.inputTipAttached, onChange = tipChange)))
         Spacer(Modifier.height(24.dp))
         Text("App Pressure Sensitivity", color = Pc.SlideLabel, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(start = 13.dp).height(19.dp))
+        AppPressureCalibration(vm)
+        Spacer(Modifier.height(12.dp))
         Box(Modifier.padding(horizontal = 7.dp).fillMaxWidth().aspectRatio(1f).background(CurveFill)) {
             PressureCurve(vm.inputCurve, Modifier.fillMaxSize(), grid = CurveGrid, edge = CurveEdge, line = CurveLine) { vm.changeInput(curve = it) }
         }
