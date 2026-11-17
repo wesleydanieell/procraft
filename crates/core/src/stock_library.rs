@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use procraft_engine::brush::{Notches, PressureCurve};
+use procraft_engine::brush::{Brush, Notches, PressureCurve};
 use procraft_engine::brushfile::{BrushFile, StandIn, Texture};
 use procraft_engine::geom::Vec2;
 use procraft_engine::library::{BrushSet, SHELF, library};
@@ -88,6 +88,19 @@ impl StockBrush {
     }
 }
 
+/// The pencil stock presets inherited very low upper opacity and steep pressure fading.
+/// Flow is also raised to FLOW_POWER (2.5) in the stroke engine, so the combination makes
+/// textured pencil marks practically invisible at ordinary stylus pressure. Improve the
+/// *stock defaults* here, without touching imported brushes, grain, shape or pressure curves.
+/// Keeping this outside generated `stock_brushes.rs` also lets saved brushes inherit the new
+/// defaults through their shipped origin, while retaining each user's explicit overrides.
+fn readable_pencil(mut brush: Brush) -> Brush {
+    brush.max_opacity = brush.max_opacity.max(0.85);
+    brush.pressure_opacity = brush.pressure_opacity.min(0.70);
+    brush.set_setting("pressure_flow", brush.setting("pressure_flow").min(0.40));
+    brush
+}
+
 /// The stock sets, each brush made as its file would be read: its stand-ins shared with every other
 /// brush drawing the same, and drawn only once a brush wants them (most never are).
 fn stock_sets() -> Vec<BrushSet> {
@@ -95,7 +108,14 @@ fn stock_sets() -> Vec<BrushSet> {
         .iter()
         .map(|set| BrushSet {
             name: set.name,
-            brushes: set.brushes.iter().map(|b| crate::brush_files::brush_from(&b.file())).collect(),
+            brushes: set
+                .brushes
+                .iter()
+                .map(|b| {
+                    let brush = crate::brush_files::brush_from(&b.file());
+                    if set.name == "Pencils" { readable_pencil(brush) } else { brush }
+                })
+                .collect(),
         })
         .collect()
 }
@@ -121,9 +141,47 @@ pub(crate) fn prepare() {
 
 #[cfg(test)]
 mod tests {
+    use procraft_engine::input::{Pointer, Sample};
+    use procraft_engine::stroke::StrokeBuilder;
     use procraft_engine::variant::{fnv, moved, range, shifted};
 
     use super::*;
+
+    fn stamp_alpha(brush: Brush, pressure: f32) -> f32 {
+        StrokeBuilder::new(brush, 20.0, Pointer::Stylus)
+            .preview(&[Sample::at(Vec2::new(20.0, 20.0), pressure, 0.0)])
+            .first()
+            .map_or(0.0, |stamp| stamp.alpha)
+    }
+
+    #[test]
+    fn pencils_lay_more_paint_without_changing_textures_or_other_brushes() {
+        for set in crate::stock_brushes::SETS {
+            for stock in set.brushes {
+                let before = crate::brush_files::brush_from(&stock.file());
+                let after = if set.name == "Pencils" { readable_pencil(before.clone()) } else { before.clone() };
+                assert_eq!(after.shape, before.shape, "{} shape", stock.name);
+                assert_eq!(after.grain, before.grain, "{} grain", stock.name);
+                assert_eq!(after.pressure_curve, before.pressure_curve, "{} pressure curve", stock.name);
+                if set.name == "Pencils" {
+                    assert!(after.max_opacity >= 0.85);
+                    assert!(after.pressure_opacity <= 0.70);
+                    assert!(after.setting("pressure_flow") <= 0.40);
+                    for pressure in [0.30, 0.60, 1.0] {
+                        let old = stamp_alpha(before.clone(), pressure);
+                        let new = stamp_alpha(after.clone(), pressure);
+                        assert!(new + 1e-5 >= old, "{} at {pressure}: {old} -> {new}", stock.name);
+                    }
+                } else {
+                    assert_eq!(after, before, "non-pencil {} changed", stock.name);
+                }
+            }
+        }
+        let pangolin = &crate::stock_brushes::SETS.iter().find(|s| s.name == "Pencils").unwrap().brushes[0];
+        let before = crate::brush_files::brush_from(&pangolin.file());
+        assert_eq!(pangolin.name, "Pangolin");
+        assert!(stamp_alpha(readable_pencil(before.clone()), 0.35) > stamp_alpha(before, 0.35) * 1.5);
+    }
 
     #[test]
     fn ours_from_before_ship_first_at_their_places_and_the_stock_sets_after() {
