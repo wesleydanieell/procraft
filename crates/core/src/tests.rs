@@ -15688,6 +15688,7 @@ fn only_a_stroke_shown_on_to_the_pen_waits_to_even_out_whole_pixels() {
 /// 44-point grid exclusion. The default remains unchanged for upstream UI.
 #[test]
 fn host_can_draw_native_surround_grid_from_top_edge() {
+    use procraft_engine::geom::Vec2;
     let s = CanvasSession::new(64, 64);
     s.set_display_scale(2.25);
     assert!((s.shared.lock().surround_grid(Vec2::ZERO).top - 99.0).abs() < 0.01);
