@@ -31,6 +31,7 @@ mod colour_models;
 mod crop;
 mod crop_edit;
 mod device;
+mod external_overlay;
 mod frame;
 mod gallery;
 mod gestures;
@@ -479,6 +480,8 @@ pub(crate) struct State {
     pub(crate) key_drag: Option<keys::KeyDragging>,
     pub(crate) window_size: (u32, u32),
     pub(crate) reconfigure: bool,
+    /// A transient native host layer drawn during the exact ProCraft GPU present.
+    pub(crate) external_overlay: Option<external_overlay::ExternalOverlay>,
     /// Whether the window's surface may be wide colour (Display P3) at all: the app turns it off
     /// for a screen that shows it wrongly. On until told.
     pub(crate) wide_colour_allowed: bool,
@@ -1672,6 +1675,7 @@ impl CanvasSession {
             key_drag: None,
             window_size: (1, 1),
             reconfigure: false,
+            external_overlay: None,
             wide_colour_allowed: true,
             tool: ToolKind::Paint,
             previous_tool: None,
@@ -2325,6 +2329,39 @@ impl CanvasSession {
                 st.grid_top = Some(top_points);
                 self.shared.frame(&mut st);
             }
+        }
+    }
+
+    /// Host-provided normal-alpha pixels composited IN the ProCraft native GPU
+    /// presentation, not a separate Android SurfaceView or Compose image.
+    /// Each pixel frame retains the camera originally used by its native
+    /// editor; the ProCraft renderer applies the CURRENT camera in its own
+    /// swapchain frame, so panning/zooming/rotating never lag between Studios.
+    pub fn set_external_overlay_rgba(
+        &self,
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        viewport_width: u32,
+        viewport_height: u32,
+        camera: Vec<f32>,
+    ) -> bool {
+        let Some(overlay) =
+            external_overlay::ExternalOverlay::new(pixels, width, height, (viewport_width, viewport_height), &camera)
+        else {
+            return false;
+        };
+        let mut st = self.shared.lock();
+        st.external_overlay = Some(overlay);
+        self.shared.frame(&mut st);
+        true
+    }
+
+    /// Discard temporary raster without changing Sketch's native document.
+    pub fn clear_external_overlay(&self) {
+        let mut st = self.shared.lock();
+        if st.external_overlay.take().is_some() {
+            self.shared.frame(&mut st);
         }
     }
 

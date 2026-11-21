@@ -112,6 +112,8 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
     let mut last_frame: Option<Instant> = None;
     let started = Instant::now();
     let mut pipelines_kept = false;
+    // The same window surface and GPU submit as the underlying Sketch canvas.
+    let mut host_overlay = crate::external_overlay::OverlayGpu::new();
     loop {
         let (size, reconfigure, wants_wide) = {
             let mut st = shared.lock();
@@ -192,6 +194,14 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
                 continue;
             }
             st.draw_frame(&view, format, size, screen, started);
+            // Blend transient VectorCraft pixels after ProCraft's native canvas
+            // but BEFORE this exact surface frame gets presented. Crucially,
+            // use st.view here, not a separately-polled Kotlin camera.
+            if let (Some(source), Some(camera), Some(gpu)) =
+                (st.external_overlay.as_ref(), st.view.map(|v| v.to_screen()), st.gpu.as_ref())
+            {
+                host_overlay.draw(gpu, &view, format, camera, source);
+            }
             let now = Instant::now();
             if let Some(prev) = last_present {
                 st.frame_interval_ms = now.duration_since(prev).as_secs_f32() * 1000.0;

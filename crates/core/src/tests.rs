@@ -52,6 +52,23 @@ fn pixel(s: &CanvasSession, x: u32, y: u32) -> [u8; 4] {
     [px[i], px[i + 1], px[i + 2], px[i + 3]]
 }
 
+/// External overlay pixels are transient and cannot corrupt the ProCraft
+/// native document or an unrelated layer. Invalid payloads do not draw.
+#[test]
+fn external_overlay_setter_rejects_invalid_and_does_not_edit_canvas() {
+    let s = CanvasSession::new(64, 64);
+    let before = s.shared.lock().revision;
+    assert!(!s.set_external_overlay_rgba(vec![1, 2], 4, 4, 64, 64, vec![1., 0., 0., 1., 0., 0.]));
+    assert!(s.shared.lock().external_overlay.is_none());
+    assert!(!s.set_external_overlay_rgba(vec![255; 4 * 4 * 4], 4, 4, 64, 64, vec![0., 0., 0., 0., 0., 0.]));
+    assert!(s.set_external_overlay_rgba(vec![255; 4 * 4 * 4], 4, 4, 64, 64, vec![1., 0., 0., 1., 0., 0.]));
+    assert!(s.shared.lock().external_overlay.is_some());
+    assert_eq!(s.shared.lock().revision, before);
+    s.clear_external_overlay();
+    assert!(s.shared.lock().external_overlay.is_none());
+    assert_eq!(s.shared.lock().revision, before);
+}
+
 /// Hosts with independent floating toolbars must not inherit ProCraft's
 /// 44-point grid exclusion. The default remains unchanged for upstream UI.
 #[test]
