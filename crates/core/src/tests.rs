@@ -15683,3 +15683,19 @@ fn only_a_stroke_shown_on_to_the_pen_waits_to_even_out_whole_pixels() {
     assert!(reads_whole(ToolKind::Paint));
     assert!(!reads_whole(ToolKind::Smudge));
 }
+
+/// Hosts with independent floating toolbars must not inherit ProCraft's
+/// 44-point grid exclusion. The default remains unchanged for upstream UI.
+#[test]
+fn host_can_draw_native_surround_grid_from_top_edge() {
+    let s = CanvasSession::new(64, 64);
+    s.set_display_scale(2.25);
+    assert!((s.shared.lock().surround_grid(Vec2::ZERO).top - 99.0).abs() < 0.01);
+    s.set_grid_top(0.0);
+    assert_eq!(s.shared.lock().surround_grid(Vec2::ZERO).top, 0.0);
+    s.set_grid_top(-1.0);
+    s.set_grid_top(f32::NAN);
+    assert_eq!(s.shared.lock().surround_grid(Vec2::ZERO).top, 0.0);
+    s.set_grid_top(12.0);
+    assert!((s.shared.lock().surround_grid(Vec2::ZERO).top - 27.0).abs() < 0.01);
+}

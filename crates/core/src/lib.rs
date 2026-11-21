@@ -638,6 +638,9 @@ pub(crate) struct State {
     /// Where the middle of one of the surround grid's lines is, across and down (window pixels);
     /// none given, half a point in from the top-left corner.
     grid_origin: Option<[f32; 2]>,
+    /// Optional transparent surround-grid top inset in interface points.
+    /// None keeps ProCraft's usual integrated 44pt toolbar exclusion.
+    grid_top: Option<f32>,
     /// The light interface: a light surround and grid.
     light: bool,
     /// The document before a continuous change (a slider drag) began.
@@ -787,7 +790,7 @@ impl State {
         procraft_gpu::SurroundGrid {
             spacing: GRID_SPACING_PT * s,
             origin: [x + by.x, y + by.y],
-            top: GRID_TOP_PT * self.interface_scale() + by.y,
+            top: self.grid_top.unwrap_or(GRID_TOP_PT) * self.interface_scale() + by.y,
             width: GRID_WIDTH_PT * s,
             color: if self.light { GRID_LINE_LIGHT } else { GRID_LINE },
         }
@@ -1749,6 +1752,7 @@ impl CanvasSession {
             interface_size: 1.0,
             grey_view: false,
             grid_origin: None,
+            grid_top: None,
             light: false,
             pending_doc: None,
             pending_name: None,
@@ -2307,6 +2311,20 @@ impl CanvasSession {
             let mut st = self.shared.lock();
             st.grid_origin = Some([x, y]);
             self.shared.frame(&mut st);
+        }
+    }
+
+    /// Top clearance for the fixed-to-glass surround grid, in interface points.
+    /// ProCraft's integrated toolbar keeps its 44-point clearance by default;
+    /// hosts with floating chrome can set 0 to draw the native grid all the
+    /// way to the window's top edge (without painting over the artwork).
+    pub fn set_grid_top(&self, top_points: f32) {
+        if top_points.is_finite() && (0.0..=1000.0).contains(&top_points) {
+            let mut st = self.shared.lock();
+            if st.grid_top != Some(top_points) {
+                st.grid_top = Some(top_points);
+                self.shared.frame(&mut st);
+            }
         }
     }
 
