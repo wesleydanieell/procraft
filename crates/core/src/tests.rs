@@ -52,6 +52,23 @@ fn pixel(s: &CanvasSession, x: u32, y: u32) -> [u8; 4] {
     [px[i], px[i + 1], px[i + 2], px[i + 3]]
 }
 
+/// Hosts with independent floating toolbars must not inherit ProCraft's
+/// 44-point grid exclusion. The default remains unchanged for upstream UI.
+#[test]
+fn host_can_draw_native_surround_grid_from_top_edge() {
+    use procraft_engine::geom::Vec2;
+    let s = CanvasSession::new(64, 64);
+    s.set_display_scale(2.25);
+    assert!((s.shared.lock().surround_grid(Vec2::ZERO).top - 99.0).abs() < 0.01);
+    s.set_grid_top(0.0);
+    assert_eq!(s.shared.lock().surround_grid(Vec2::ZERO).top, 0.0);
+    s.set_grid_top(-1.0);
+    s.set_grid_top(f32::NAN);
+    assert_eq!(s.shared.lock().surround_grid(Vec2::ZERO).top, 0.0);
+    s.set_grid_top(12.0);
+    assert!((s.shared.lock().surround_grid(Vec2::ZERO).top - 27.0).abs() < 0.01);
+}
+
 /// Frames are drawn no closer together than a little under the screen's refresh period, and with
 /// no rate given (or one that can't be), as soon as they are wanted.
 #[test]
@@ -15682,21 +15699,4 @@ fn only_a_stroke_shown_on_to_the_pen_waits_to_even_out_whole_pixels() {
     // steps ahead; a smudge shows only what it has laid, so nothing of it waits
     assert!(reads_whole(ToolKind::Paint));
     assert!(!reads_whole(ToolKind::Smudge));
-}
-
-/// Hosts with independent floating toolbars must not inherit ProCraft's
-/// 44-point grid exclusion. The default remains unchanged for upstream UI.
-#[test]
-fn host_can_draw_native_surround_grid_from_top_edge() {
-    use procraft_engine::geom::Vec2;
-    let s = CanvasSession::new(64, 64);
-    s.set_display_scale(2.25);
-    assert!((s.shared.lock().surround_grid(Vec2::ZERO).top - 99.0).abs() < 0.01);
-    s.set_grid_top(0.0);
-    assert_eq!(s.shared.lock().surround_grid(Vec2::ZERO).top, 0.0);
-    s.set_grid_top(-1.0);
-    s.set_grid_top(f32::NAN);
-    assert_eq!(s.shared.lock().surround_grid(Vec2::ZERO).top, 0.0);
-    s.set_grid_top(12.0);
-    assert!((s.shared.lock().surround_grid(Vec2::ZERO).top - 27.0).abs() < 0.01);
 }
