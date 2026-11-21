@@ -13,6 +13,9 @@ struct CameraMapping {
 @fragment fn fragment(@builtin(position) screen: vec4<f32>) -> @location(0) vec4<f32> {
     let p = vec3<f32>(screen.xy,1.);
     let uv = vec2<f32>(dot(camera.x.xyz,p),dot(camera.y.xyz,p));
+    // Sample before conditional discard: derivatives remain valid in fragment
+    // quads at the transformed image edge, including during canvas rotation.
+    let rgba = textureSample(pixels,bilinear,uv);
     if any(uv < vec2<f32>(0.)) || any(uv >= vec2<f32>(1.)) { discard; }
-    return textureSample(pixels,bilinear,uv);
+    return rgba;
 }

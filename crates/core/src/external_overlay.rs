@@ -279,6 +279,55 @@ impl OverlayGpu {
 mod tests {
     use super::*;
     #[test]
+    fn shader_builds_and_blends_in_a_single_wgpu_surface_frame() {
+        // Exercise WGSL/pipeline validity, not just the affine math.
+        // CI without a GPU may legitimately skip this fixture.
+        let gpu = match Gpu::headless() {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                eprintln!("headless GPU unavailable: {e}");
+                return;
+            }
+        };
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Diverge compositor test target"),
+            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let mut encoder =
+            gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Diverge test clear") });
+        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Diverge test clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        }));
+        gpu.queue.submit([encoder.finish()]);
+        let source = ExternalOverlay::new(vec![255; 32 * 32 * 4], 32, 32, (64, 64), &[1., 0., 0., 1., 0., 0.]).unwrap();
+        let mut pass = OverlayGpu::new();
+        let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        pass.draw(&gpu, &view, wgpu::TextureFormat::Rgba8Unorm, Affine::IDENTITY, &source);
+        // Repeat on a different camera. This updates only the shader uniform,
+        // reusing exactly the same RGBA texture and native render pass.
+        pass.draw(&gpu, &view, wgpu::TextureFormat::Rgba8Unorm, Affine { e: 12., f: -6., ..Affine::IDENTITY }, &source);
+        let error = pollster::block_on(scope.pop());
+        assert!(error.is_none(), "WGPU overlay validation: {error:?}");
+    }
+
+    #[test]
     fn cached_frame_uses_current_native_camera_in_same_surface() {
         let rgba = vec![255u8; 100 * 50 * 4];
         let frame = ExternalOverlay::new(rgba, 100, 50, (200, 100), &[2., 0., 0., 2., 0., 0.]).unwrap();
