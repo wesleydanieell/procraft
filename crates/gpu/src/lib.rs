@@ -19,9 +19,9 @@ pub use canvas::plugin_filter::{FilterCode, FilterProgram, FilterRun, read_filte
 pub use canvas::plugin_picture::{PictureCode, PictureProgram, PictureStop, read_picture, read_picture_given};
 pub use canvas::{
     Backdrop, Canvas, DisplayLut, Filter, FineThumbnail, LayerStore, LayerThumbnailStep, LiquifyMode, LiquifyStamp,
-    MOST_TIPS, PendingAlphas, PendingThumbnail, Readback, ReadyToPark, RemakeStats, Resample, STORE_LIT, SecondStroke,
-    SelectionLook, SharedStroke, SmallScene, Stripes, StrokeStyle, StrokeTool, SurroundGrid, Target, Thumbnail,
-    TipKind, most_resident, read_texture, start_reading, textures_bytes,
+    LiveCompositeReadback, MOST_TIPS, PendingAlphas, PendingThumbnail, Readback, ReadyToPark, RemakeStats, Resample,
+    STORE_LIT, SecondStroke, SelectionLook, SharedStroke, SmallScene, Stripes, StrokeStyle, StrokeTool, SurroundGrid,
+    Target, Thumbnail, TipKind, most_resident, read_texture, start_reading, textures_bytes,
 };
 pub use kept::keep_pipelines_in;
 pub use lighting::Lighting;

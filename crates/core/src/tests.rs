@@ -4878,6 +4878,7 @@ fn live_composite_receipts_preserve_open_stroke_and_native_undo() {
             match s.capture_live_composite() {
                 LiveCompositeCapture::Frame { frame } => return frame,
                 LiveCompositeCapture::Pending => continue,
+                LiveCompositeCapture::AwaitingInput => panic!("default brush unexpectedly deferred input"),
                 LiveCompositeCapture::Unavailable { reason } => panic!("{reason}"),
             }
         }
@@ -4906,6 +4907,39 @@ fn live_composite_receipts_preserve_open_stroke_and_native_undo() {
     assert!(frame(&s).stroke_active);
     s.stroke_cancel();
     assert_eq!(frame(&s).image.rgba, initial.image.rgba);
+}
+
+#[test]
+fn live_composite_reports_wet_input_deferral_without_settling_the_stroke() {
+    use crate::layers::LiveCompositeCapture;
+    use procraft_engine::brush::Brush;
+    let Some(s) = session(96, 96) else { return };
+    let mut brush = Brush::round_pen();
+    brush.set_setting("rendering_mode", 5.0);
+    brush.set_setting("wet_pull", 0.5);
+    {
+        let mut st = s.shared.lock();
+        let (set, index) = st.paint_brush;
+        st.library[set].brushes[index] = brush;
+    }
+    s.set_brush_size(0.3);
+    s.set_color(1.0, 0.0, 0.0);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(12.0, 48.0, 100.0)]);
+    s.stroke_add((1..12).map(|i| sample(12.0 + i as f32 * 5.0, 48.0, 100.0 + i as f64 * 16.0)).collect());
+    let capture = || {
+        for _ in 0..16 {
+            let frame = s.capture_live_composite();
+            if !matches!(frame, LiveCompositeCapture::Pending) {
+                return frame;
+            }
+        }
+        panic!("cache did not settle");
+    };
+    assert!(matches!(capture(), LiveCompositeCapture::AwaitingInput));
+    assert!(matches!(capture(), LiveCompositeCapture::AwaitingInput));
+    assert!(s.shared.lock().stroke.is_some());
+    s.stroke_end(vec![]);
+    assert!(matches!(capture(), LiveCompositeCapture::Frame { frame } if !frame.stroke_active));
 }
 
 #[test]

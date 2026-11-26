@@ -97,11 +97,13 @@ pub struct LiveCompositeFrame {
     pub stroke_active: bool,
 }
 
-/// No fallback pixels: Pending means the caller can ask again after another render.
+/// No fallback pixels: Pending may progress on another render; AwaitingInput
+/// will not progress until a new native input or settlement command.
 #[derive(Clone, Debug, PartialEq, uniffi::Enum)]
 pub enum LiveCompositeCapture {
     Frame { frame: LiveCompositeFrame },
     Pending,
+    AwaitingInput,
     Unavailable { reason: String },
 }
 
@@ -993,8 +995,9 @@ impl CanvasSession {
             return LiveCompositeCapture::Unavailable { reason: "offscreen canvas not prepared".into() };
         };
         let rgba = match canvas.capture_live_composite(gpu, &mut st.doc) {
-            Ok(Some(rgba)) => rgba,
-            Ok(None) => return LiveCompositeCapture::Pending,
+            Ok(procraft_gpu::LiveCompositeReadback::Ready(rgba)) => rgba,
+            Ok(procraft_gpu::LiveCompositeReadback::Pending) => return LiveCompositeCapture::Pending,
+            Ok(procraft_gpu::LiveCompositeReadback::AwaitingInput) => return LiveCompositeCapture::AwaitingInput,
             Err(err) => return LiveCompositeCapture::Unavailable { reason: err.to_string() },
         };
         if (st.doc.width(), st.doc.height()) != (width, height)

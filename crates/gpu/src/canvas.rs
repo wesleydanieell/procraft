@@ -681,6 +681,15 @@ pub struct Thumbnail {
     pub rgba: Vec<u8>,
 }
 
+/// Readiness of the real document composite, not the native history transaction.
+pub enum LiveCompositeReadback {
+    Ready(Vec<u8>),
+    /// Cache or queued GPU work can make progress on another render.
+    Pending,
+    /// A wet pass intentionally waits for more input or stroke settlement.
+    AwaitingInput,
+}
+
 /// A [`Thumbnail`] on its way back from the GPU: its copy is queued (under whatever lock guards
 /// the canvas), its pixels waited for later, the lock let go ([`PendingThumbnail::pixels`]).
 pub struct PendingThumbnail {
@@ -9836,12 +9845,15 @@ impl Canvas {
     /// Render and read the current document-space composite, including an open stroke.
     /// Unlike `changes_queued`, readiness here does not require a stroke to end.
     /// A cache remake or deferred drawing work must never be returned as a current picture.
-    pub fn capture_live_composite(&mut self, gpu: &Gpu, doc: &mut Document) -> Result<Option<Vec<u8>>, GpuError> {
+    pub fn capture_live_composite(&mut self, gpu: &Gpu, doc: &mut Document) -> Result<LiveCompositeReadback, GpuError> {
         self.render(gpu, doc, None);
         if self.busy() || !self.ops.is_empty() || !self.dirty.is_empty() {
-            return Ok(None);
+            return Ok(LiveCompositeReadback::Pending);
         }
-        self.read_composite(gpu).map(Some)
+        if self.smudge.as_ref().is_some_and(|smudge| !smudge.pending.is_empty()) {
+            return Ok(LiveCompositeReadback::AwaitingInput);
+        }
+        self.read_composite(gpu).map(LiveCompositeReadback::Ready)
     }
 
     /// The composite's pixels (premultiplied RGBA8, rows top to bottom) as last rendered: after
