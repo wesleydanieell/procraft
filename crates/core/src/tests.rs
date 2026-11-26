@@ -4917,6 +4917,8 @@ fn live_composite_reports_wet_input_deferral_without_settling_the_stroke() {
     let mut brush = Brush::round_pen();
     brush.set_setting("rendering_mode", 5.0);
     brush.set_setting("wet_pull", 0.5);
+    brush.set_setting("wet_dilution", 0.6);
+    assert!(brush.mixes_wet() && brush.mixes_with_stroke(), "fixture must exercise actual wet blending");
     {
         let mut st = s.shared.lock();
         let (set, index) = st.paint_brush;
