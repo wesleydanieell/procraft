@@ -4,7 +4,7 @@
 //! Calls queue work; [`Canvas::render`] records and submits it in order, recomposites what
 //! changed and, given a target, draws the canvas to it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
@@ -688,6 +688,58 @@ pub enum LiveCompositeReadback {
     Pending,
     /// A wet pass intentionally waits for more input or stroke settlement.
     AwaitingInput,
+}
+
+/// Canvas-local composite identity, independent of native history steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompositeReceipt {
+    pub canvas: u64,
+    pub revision: u64,
+}
+
+/// Full fallback or a conservative region covering every recomposited pixel
+/// since the requested base. An empty rectangle means no composite writes.
+pub struct LiveCompositeRegion {
+    pub receipt: CompositeReceipt,
+    pub base: Option<CompositeReceipt>,
+    pub rect: IRect,
+    pub rgba: Vec<u8>,
+}
+pub enum LiveCompositeRegionReadback {
+    Ready(LiveCompositeRegion),
+    Pending,
+    AwaitingInput,
+}
+
+const LIVE_DAMAGE_HISTORY: usize = 64;
+
+#[derive(Default)]
+struct CompositeDamage {
+    revision: u64,
+    history: VecDeque<(u64, IRect)>,
+}
+impl CompositeDamage {
+    fn record(&mut self, rect: IRect) {
+        // Saturation disables delta capture instead of ever reusing an old token.
+        self.revision = self.revision.saturating_add(1);
+        if self.history.len() == LIVE_DAMAGE_HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back((self.revision, rect));
+    }
+    fn since(&self, revision: u64) -> Option<IRect> {
+        if revision == 0 || revision > self.revision || self.revision == u64::MAX {
+            return None;
+        }
+        if revision == self.revision {
+            return Some(IRect::EMPTY);
+        }
+        let first = self.history.front()?.0;
+        if revision < first.saturating_sub(1) {
+            return None;
+        }
+        Some(self.history.iter().filter(|(r, _)| *r > revision).fold(IRect::EMPTY, |a, (_, b)| a.union(*b)))
+    }
 }
 
 /// A [`Thumbnail`] on its way back from the GPU: its copy is queued (under whatever lock guards
@@ -2504,6 +2556,7 @@ pub struct Canvas {
     filter_run: Option<plugin_filter::FilterRun>,
     /// How many times the composite has been redrawn.
     composites: u64,
+    live_damage: CompositeDamage,
     active: Option<ActiveStroke>,
     smudge: Option<Smudge>,
     /// The open smudge stroke couldn't be begun (what it takes couldn't be made): it does nothing
@@ -2875,6 +2928,7 @@ impl Canvas {
             pieces_sent: 0,
             filter_run: None,
             composites: 0,
+            live_damage: CompositeDamage::default(),
             active: None,
             smudge: None,
             smudge_refused: false,
@@ -6225,6 +6279,7 @@ impl Canvas {
             if !dirty.is_empty() {
                 self.composite(device, doc, &mut encoder, &mut uniforms, dirty);
                 self.composites = self.composites.wrapping_add(1);
+                self.live_damage.record(dirty);
                 self.frost_stale = self.frost_stale.union(dirty);
             }
             self.dirty = IRect::EMPTY;
@@ -9856,6 +9911,33 @@ impl Canvas {
         self.read_composite(gpu).map(LiveCompositeReadback::Ready)
     }
 
+    /// Read only pixels possibly changed since a caller-held complete receipt.
+    /// Damage is recorded at the actual composite write, including renders outside
+    /// this method. Failed reads and deferred wet passes never consume damage.
+    pub fn capture_live_composite_region(
+        &mut self,
+        gpu: &Gpu,
+        doc: &mut Document,
+        base: Option<CompositeReceipt>,
+    ) -> Result<LiveCompositeRegionReadback, GpuError> {
+        self.render(gpu, doc, None);
+        if self.busy() || !self.ops.is_empty() || !self.dirty.is_empty() {
+            return Ok(LiveCompositeRegionReadback::Pending);
+        }
+        if self.smudge.as_ref().is_some_and(|s| !s.pending.is_empty()) {
+            return Ok(LiveCompositeRegionReadback::AwaitingInput);
+        }
+        let receipt = CompositeReceipt { canvas: self.id, revision: self.live_damage.revision };
+        let damage = base.filter(|b| b.canvas == self.id).and_then(|b| self.live_damage.since(b.revision));
+        let (base, rect) = match damage {
+            Some(rect) => (base, rect.intersect(self.full())),
+            None => (None, self.full()),
+        };
+        let rgba =
+            if rect.is_empty() { Vec::new() } else { start_reading_part(gpu, &self.composite, rect).pixels()? };
+        Ok(LiveCompositeRegionReadback::Ready(LiveCompositeRegion { receipt, base, rect, rgba }))
+    }
+
     /// The composite's pixels (premultiplied RGBA8, rows top to bottom) as last rendered: after
     /// [`Canvas::render_finished`], the picture as it is. Waits for the GPU.
     pub fn read_composite(&self, gpu: &Gpu) -> Result<Vec<u8>, GpuError> {
@@ -12247,6 +12329,27 @@ fn start_reading_part(gpu: &Gpu, texture: &wgpu::Texture, rect: IRect) -> Readba
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_damage_journal_bounds_and_eviction() {
+        let mut journal = CompositeDamage::default();
+        assert_eq!(journal.since(0), None);
+        journal.record(IRect::new(1, 2, 3, 4));
+        assert_eq!(journal.since(1), Some(IRect::EMPTY));
+        journal.record(IRect::new(7, 8, 9, 10));
+        journal.record(IRect::new(3, 4, 5, 6));
+        assert_eq!(journal.since(1), Some(IRect::new(3, 4, 9, 10)));
+        assert_eq!(journal.since(4), None);
+        for _ in 0..63 {
+            journal.record(IRect::new(0, 0, 1, 1));
+        }
+        assert_eq!(journal.history.len(), LIVE_DAMAGE_HISTORY);
+        assert_eq!(journal.since(1), None);
+        assert_eq!(journal.since(2), Some(IRect::new(0, 0, 5, 6)));
+        journal.revision = u64::MAX;
+        journal.record(IRect::new(0, 0, 1, 1));
+        assert_eq!(journal.since(u64::MAX), None);
+    }
 
     /// Pictures of every size up to a few dozen, painted in patches with clear between (as a
     /// layer is), the shrunken ones and the painted bounds as the old pixel-at-a-time ways give.

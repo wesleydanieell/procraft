@@ -4910,8 +4910,105 @@ fn live_composite_receipts_preserve_open_stroke_and_native_undo() {
 }
 
 #[test]
+fn live_composite_patch_reconstructs_native_picture_across_missed_renders_and_undo() {
+    use crate::layers::{LiveCompositeCapture, LiveCompositePatch, LiveCompositePatchCapture, LiveCompositeToken};
+    let s = session(256, 256).expect("regional capture requires native GPU");
+    fn capture(s: &CanvasSession, base: Option<LiveCompositeToken>) -> LiveCompositePatch {
+        for _ in 0..16 {
+            match s.capture_live_composite_patch(base.clone()) {
+                LiveCompositePatchCapture::Frame { patch } => return patch,
+                LiveCompositePatchCapture::Pending => continue,
+                other => panic!("unexpected capture {other:?}"),
+            }
+        }
+        panic!("native cache never settled");
+    }
+    fn full(s: &CanvasSession) -> Vec<u8> {
+        for _ in 0..16 {
+            match s.capture_live_composite() {
+                LiveCompositeCapture::Frame { frame } => return frame.image.rgba,
+                LiveCompositeCapture::Pending => continue,
+                other => panic!("unexpected capture {other:?}"),
+            }
+        }
+        panic!("native cache never settled");
+    }
+    fn apply(p: &LiveCompositePatch, pixels: &mut [u8]) {
+        assert_eq!((p.canvas_width, p.canvas_height), (256, 256));
+        let stride = p.canvas_width as usize * 4;
+        let row = p.image.width as usize * 4;
+        assert_eq!(p.image.rgba.len(), row * p.image.height as usize);
+        if row == 0 {
+            assert_eq!(p.image.height, 0);
+            return;
+        }
+        for (i, line) in p.image.rgba.chunks_exact(row).enumerate() {
+            let offset = (p.y as usize + i) * stride + p.x as usize * 4;
+            pixels[offset..offset + row].copy_from_slice(line);
+        }
+    }
+    s.set_background_visible(false);
+    let initial = capture(&s, None);
+    assert!(initial.base.is_none());
+    assert_eq!((initial.image.width, initial.image.height), (256, 256));
+    let mut reconstructed = initial.image.rgba.clone();
+    let unchanged = capture(&s, Some(initial.token.clone()));
+    assert_eq!(unchanged.base, Some(initial.token.clone()));
+    assert!(unchanged.image.rgba.is_empty());
+    s.set_color(1.0, 0.0, 0.0);
+    s.set_brush_size(0.035);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(30.0, 40.0, 100.0)]);
+    s.stroke_add(vec![sample(42.0, 40.0, 116.0), sample(53.0, 40.0, 132.0)]);
+    let first = capture(&s, Some(initial.token.clone()));
+    assert!(first.stroke_active);
+    assert_eq!(first.base, Some(initial.token.clone()));
+    assert!(first.image.rgba.len() < initial.image.rgba.len());
+    assert!(!first.image.rgba.is_empty());
+    apply(&first, &mut reconstructed);
+    assert_eq!(reconstructed, full(&s));
+    // A native query and a full capture can render in between regional requests.
+    s.stroke_add(vec![sample(65.0, 44.0, 148.0), sample(79.0, 44.0, 164.0)]);
+    s.layer_versions();
+    let skipped = capture(&s, Some(initial.token.clone()));
+    let mut from_initial = initial.image.rgba.clone();
+    apply(&skipped, &mut from_initial);
+    assert_eq!(from_initial, full(&s));
+    let replay = capture(&s, Some(initial.token.clone()));
+    assert_eq!(replay.token, skipped.token);
+    assert_eq!(replay.image, skipped.image);
+    s.stroke_end(vec![]);
+    let ended = capture(&s, Some(skipped.token.clone()));
+    apply(&ended, &mut from_initial);
+    assert!(!ended.stroke_active);
+    assert_eq!(from_initial, full(&s));
+    s.undo();
+    let undo = capture(&s, Some(ended.token));
+    apply(&undo, &mut from_initial);
+    assert_eq!(from_initial, initial.image.rgba);
+    assert_eq!(from_initial, full(&s));
+    let foreign = capture(
+        &s,
+        Some(LiveCompositeToken {
+            canvas_id: initial.token.canvas_id.wrapping_add(1),
+            composite_revision: undo.token.composite_revision,
+        }),
+    );
+    assert!(foreign.base.is_none());
+    assert_eq!(foreign.image.rgba, from_initial);
+    // Evicted damage history forces an exact full fallback.
+    for i in 0..70 {
+        assert!(s.set_background_visible(i % 2 == 0));
+        full(&s);
+    }
+    let evicted = capture(&s, Some(initial.token));
+    assert!(evicted.base.is_none());
+    assert_eq!((evicted.image.width, evicted.image.height), (256, 256));
+    assert_eq!(evicted.image.rgba, full(&s));
+}
+
+#[test]
 fn live_composite_reports_wet_input_deferral_without_settling_the_stroke() {
-    use crate::layers::LiveCompositeCapture;
+    use crate::layers::{LiveCompositeCapture, LiveCompositePatchCapture};
     use procraft_engine::brush::Brush;
     let Some(s) = session(96, 96) else { return };
     let mut brush = Brush::round_pen();
@@ -4924,6 +5021,10 @@ fn live_composite_reports_wet_input_deferral_without_settling_the_stroke() {
         let (set, index) = st.paint_brush;
         st.library[set].brushes[index] = brush;
     }
+    let base = match s.capture_live_composite_patch(None) {
+        LiveCompositePatchCapture::Frame { patch } => patch.token,
+        other => panic!("initial regional capture: {other:?}"),
+    };
     s.set_brush_size(0.3);
     s.set_color(1.0, 0.0, 0.0);
     s.stroke_begin(PointerKind::Stylus, vec![sample(12.0, 48.0, 100.0)]);
@@ -4939,9 +5040,15 @@ fn live_composite_reports_wet_input_deferral_without_settling_the_stroke() {
     };
     assert!(matches!(capture(), LiveCompositeCapture::AwaitingInput));
     assert!(matches!(capture(), LiveCompositeCapture::AwaitingInput));
+    for _ in 0..2 {
+        assert!(matches!(s.capture_live_composite_patch(Some(base.clone())), LiveCompositePatchCapture::AwaitingInput));
+    }
     assert!(s.shared.lock().stroke.is_some());
     s.stroke_end(vec![]);
     assert!(matches!(capture(), LiveCompositeCapture::Frame { frame } if !frame.stroke_active));
+    assert!(
+        matches!(s.capture_live_composite_patch(Some(base)), LiveCompositePatchCapture::Frame { patch } if !patch.stroke_active && !patch.image.rgba.is_empty())
+    );
 }
 
 #[test]

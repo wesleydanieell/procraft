@@ -107,6 +107,36 @@ pub enum LiveCompositeCapture {
     Unavailable { reason: String },
 }
 
+/// Opaque canvas-local receipt; adapters also bind their own document/session epoch.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct LiveCompositeToken {
+    pub canvas_id: u64,
+    pub composite_revision: u64,
+}
+
+/// Packed document-space region, or full fallback when base is absent. A zero
+/// width/height region with empty bytes means no write since the exact base.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct LiveCompositePatch {
+    pub token: LiveCompositeToken,
+    pub base: Option<LiveCompositeToken>,
+    pub canvas_width: u32,
+    pub canvas_height: u32,
+    pub x: u32,
+    pub y: u32,
+    pub image: ThumbnailImage,
+    pub revision: u64,
+    pub layer_versions: Vec<LayerVersion>,
+    pub stroke_active: bool,
+}
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum LiveCompositePatchCapture {
+    Frame { patch: LiveCompositePatch },
+    Pending,
+    AwaitingInput,
+    Unavailable { reason: String },
+}
+
 /// What a row of a layer's options menu does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum LayerOption {
@@ -1015,6 +1045,68 @@ impl CanvasSession {
         LiveCompositeCapture::Frame {
             frame: LiveCompositeFrame {
                 image: ThumbnailImage { width, height, rgba },
+                revision: st.edits(),
+                layer_versions,
+                stroke_active: st.stroke.is_some(),
+            },
+        }
+    }
+
+    /// Atomic regional readback with a bounded, non-consuming damage history.
+    /// A stale/foreign base falls back to a complete image, never a guessed patch.
+    pub fn capture_live_composite_patch(&self, base: Option<LiveCompositeToken>) -> LiveCompositePatchCapture {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let (width, height) = (st.doc.width(), st.doc.height());
+        if width == 0
+            || height == 0
+            || width > 4096
+            || height > 4096
+            || u64::from(width) * u64::from(height) > 1_000_000
+        {
+            return LiveCompositePatchCapture::Unavailable { reason: "document exceeds live readback budget".into() };
+        }
+        let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
+            return LiveCompositePatchCapture::Unavailable { reason: "offscreen canvas not prepared".into() };
+        };
+        let native_base =
+            base.map(|b| procraft_gpu::CompositeReceipt { canvas: b.canvas_id, revision: b.composite_revision });
+        let region = match canvas.capture_live_composite_region(gpu, &mut st.doc, native_base) {
+            Ok(procraft_gpu::LiveCompositeRegionReadback::Ready(region)) => region,
+            Ok(procraft_gpu::LiveCompositeRegionReadback::Pending) => return LiveCompositePatchCapture::Pending,
+            Ok(procraft_gpu::LiveCompositeRegionReadback::AwaitingInput) => {
+                return LiveCompositePatchCapture::AwaitingInput;
+            }
+            Err(err) => return LiveCompositePatchCapture::Unavailable { reason: err.to_string() },
+        };
+        let rect = region.rect;
+        if (st.doc.width(), st.doc.height()) != (width, height)
+            || region.rgba.len() as u64 != u64::from(rect.width()) * u64::from(rect.height()) * 4
+        {
+            return LiveCompositePatchCapture::Unavailable {
+                reason: "invalid composite region or changed document extent".into(),
+            };
+        }
+        let layer_versions = st
+            .doc
+            .layers()
+            .iter()
+            .filter(|l| l.kind != LayerKind::Group)
+            .map(|l| LayerVersion { id: l.id.0, version: canvas.layer_version(l.id) })
+            .collect();
+        let token = |r: procraft_gpu::CompositeReceipt| LiveCompositeToken {
+            canvas_id: r.canvas,
+            composite_revision: r.revision,
+        };
+        LiveCompositePatchCapture::Frame {
+            patch: LiveCompositePatch {
+                token: token(region.receipt),
+                base: region.base.map(token),
+                canvas_width: width,
+                canvas_height: height,
+                x: rect.x0 as u32,
+                y: rect.y0 as u32,
+                image: ThumbnailImage { width: rect.width(), height: rect.height(), rgba: region.rgba },
                 revision: st.edits(),
                 layer_versions,
                 stroke_active: st.stroke.is_some(),

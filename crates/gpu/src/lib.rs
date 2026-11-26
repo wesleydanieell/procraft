@@ -18,10 +18,11 @@ use std::sync::{Arc, OnceLock};
 pub use canvas::plugin_filter::{FilterCode, FilterProgram, FilterRun, read_filter};
 pub use canvas::plugin_picture::{PictureCode, PictureProgram, PictureStop, read_picture, read_picture_given};
 pub use canvas::{
-    Backdrop, Canvas, DisplayLut, Filter, FineThumbnail, LayerStore, LayerThumbnailStep, LiquifyMode, LiquifyStamp,
-    LiveCompositeReadback, MOST_TIPS, PendingAlphas, PendingThumbnail, Readback, ReadyToPark, RemakeStats, Resample,
-    STORE_LIT, SecondStroke, SelectionLook, SharedStroke, SmallScene, Stripes, StrokeStyle, StrokeTool, SurroundGrid,
-    Target, Thumbnail, TipKind, most_resident, read_texture, start_reading, textures_bytes,
+    Backdrop, Canvas, CompositeReceipt, DisplayLut, Filter, FineThumbnail, LayerStore, LayerThumbnailStep, LiquifyMode,
+    LiquifyStamp, LiveCompositeReadback, LiveCompositeRegion, LiveCompositeRegionReadback, MOST_TIPS, PendingAlphas,
+    PendingThumbnail, Readback, ReadyToPark, RemakeStats, Resample, STORE_LIT, SecondStroke, SelectionLook,
+    SharedStroke, SmallScene, Stripes, StrokeStyle, StrokeTool, SurroundGrid, Target, Thumbnail, TipKind,
+    most_resident, read_texture, start_reading, textures_bytes,
 };
 pub use kept::keep_pipelines_in;
 pub use lighting::Lighting;
