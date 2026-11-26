@@ -5166,6 +5166,94 @@ fn live_paint_layers_recompose_native_stroke_and_preserve_history() {
 }
 
 #[test]
+fn editable_raw_paint_region_native_history_and_rejections() {
+    use crate::layers::{EditablePaintCommit as C, LivePaintLayersCapture};
+    let s = session(128, 128).expect("real GPU required");
+    assert!(s.set_background_visible(false));
+    let bottom = s.layers()[0].id;
+    s.set_color(0.2, 0.5, 0.8);
+    assert!(s.fill_layer(bottom));
+    let top = s.add_layer();
+    s.set_color(0.9, 0.2, 0.1);
+    s.set_brush_size(0.25);
+    s.set_brush_opacity(0.5);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(24., 48., 100.)]);
+    assert!(s.read_editable_paint_region(top, 16, 16, 64, 64).is_none());
+    s.stroke_add((1..10).map(|i| sample(24. + i as f32 * 7., 48., 100. + i as f64 * 20.)).collect());
+    s.stroke_end(vec![]);
+    fn settle(s: &CanvasSession) {
+        for _ in 0..32 {
+            if matches!(s.capture_live_paint_layers(), LivePaintLayersCapture::Frame { .. }) {
+                return;
+            }
+        }
+        panic!("native frame not ready");
+    }
+    settle(&s);
+    let read = |s: &CanvasSession| s.read_editable_paint_region(top, 0, 0, 128, 128).expect("ready native root");
+    let base = read(&s);
+    assert!(base.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0 && p[3] < 255));
+    let region = s.read_editable_paint_region(top, 17, 19, 67, 55).unwrap();
+    let mut inverted = region.rgba.clone();
+    for p in inverted.as_chunks_mut::<4>().0 {
+        for c in 0..3 {
+            p[c] = p[3] - p[c];
+        }
+    }
+    assert_ne!(inverted, region.rgba);
+    let unchanged = s.commit_editable_paint_region(region.clone(), region.rgba.clone());
+    assert_eq!(unchanged, C::Unchanged { revision: region.revision });
+    let steps = |s: &CanvasSession| s.shared.lock().canvas.as_ref().unwrap().steps_made();
+    let before_steps = steps(&s);
+    let mut wrong = region.clone();
+    wrong.canvas_id += 1;
+    assert!(matches!(s.commit_editable_paint_region(wrong, inverted.clone()), C::Rejected { .. }));
+    let mut wrong = region.clone();
+    wrong.rgba[0] ^= 1;
+    assert!(matches!(s.commit_editable_paint_region(wrong, inverted.clone()), C::Rejected { .. }));
+    let mut bad = inverted.clone();
+    bad[3] ^= 1;
+    assert!(matches!(s.commit_editable_paint_region(region.clone(), bad), C::Rejected { .. }));
+    assert!(s.read_editable_paint_region(top, u32::MAX, 0, 1, 1).is_none());
+    assert!(s.read_editable_paint_region(bottom, 0, 0, 1, 1).is_none());
+    assert_eq!(read(&s), base);
+    assert_eq!(steps(&s), before_steps);
+    assert!(
+        matches!(s.commit_editable_paint_region(region.clone(),inverted.clone()),C::Changed{revision} if revision>region.revision)
+    );
+    assert_eq!(steps(&s), before_steps + 1);
+    settle(&s);
+    let after = read(&s);
+    for (i, (a, b)) in base.rgba.as_chunks::<4>().0.iter().zip(after.rgba.as_chunks::<4>().0).enumerate() {
+        let x = i % 128;
+        let y = i / 128;
+        if (17..84).contains(&x) && (19..74).contains(&y) {
+            assert_eq!(*b, [a[3] - a[0], a[3] - a[1], a[3] - a[2], a[3]]);
+        } else {
+            assert_eq!(a, b);
+        }
+    }
+    assert_eq!(after.layer_id, base.layer_id);
+    assert!(matches!(s.commit_editable_paint_region(region.clone(), inverted.clone()), C::Rejected { .. }));
+    assert_eq!(s.undo().as_deref(), Some("Raster region colors"));
+    settle(&s);
+    assert_eq!(read(&s).rgba, base.rgba);
+    assert!(matches!(s.commit_editable_paint_region(region.clone(), inverted.clone()), C::Rejected { .. }));
+    assert_eq!(s.redo().as_deref(), Some("Raster region colors"));
+    settle(&s);
+    assert_eq!(read(&s).rgba, after.rgba);
+    assert!(s.set_layer_alpha_lock(top, true));
+    settle(&s);
+    assert!(s.read_editable_paint_region(top, 0, 0, 1, 1).is_none());
+    assert!(s.set_layer_alpha_lock(top, false));
+    settle(&s);
+    assert!(s.set_layer_locked(top, true));
+    settle(&s);
+    assert!(s.read_editable_paint_region(top, 0, 0, 1, 1).is_none());
+    assert_eq!(s.shared.lock().gpu.as_ref().unwrap().errors(), 0);
+}
+
+#[test]
 fn live_paint_layers_fail_closed_for_unsupported_scope() {
     use crate::layers::LivePaintLayersCapture as C;
     let s = session(32, 32).expect("independent layer test requires real GPU");

@@ -164,6 +164,86 @@ pub enum LivePaintLayersCapture {
     Unavailable { reason: String },
 }
 
+/// Exact native raw-region observation. No source ownership is transferred.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct EditablePaintRegion {
+    pub canvas_id: u64,
+    pub revision: u64,
+    pub layer_version: u64,
+    pub layer_id: u64,
+    pub canvas_width: u32,
+    pub canvas_height: u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum EditablePaintCommit {
+    Changed { revision: u64 },
+    Unchanged { revision: u64 },
+    Rejected { reason: String },
+}
+
+fn editable_paint_rect(
+    st: &crate::State,
+    layer_id: u64,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Option<procraft_engine::geom::IRect> {
+    let id = LayerId(layer_id);
+    let (width, height) = (st.doc.width(), st.doc.height());
+    if st.closed
+        || !st.idle()
+        || st.scene.is_some()
+        || st.plugin_artwork.is_some()
+        || st.plugin_opened.is_some()
+        || st.plugin_stepping > 0
+        || st.liquify_open()
+        || st.reveal.is_some()
+        || st.recolor.is_some()
+        || st.selection.is_some()
+        || !st.unreadable.is_empty()
+        || !st.pending_pixels.is_empty()
+        || !st.pending_stores.is_empty()
+        || st.doc.animation.is_some()
+        || st.doc.solo.is_some()
+        || st.doc.icc.is_some()
+        || st.doc.profile != procraft_engine::profile::Profile::Srgb
+        || st.doc.current() != id
+        || st.doc.chosen() != vec![id]
+        || st.doc.layers().len() > 64
+        || st.doc.is_locked(id)
+        || width > 4096
+        || height > 4096
+        || u64::from(width) * u64::from(height) > 1_000_000
+        || w == 0
+        || h == 0
+        || x.checked_add(w)? > width
+        || y.checked_add(h)? > height
+    {
+        return None;
+    }
+    let layer = st.doc.layer(id)?;
+    if layer.kind != LayerKind::Paint
+        || layer.parent.is_some()
+        || !layer.visible
+        || layer.alpha_lock
+        || layer.clipped
+        || layer.drawn_from_data()
+        || layer.blend != BlendMode::Normal
+        || layer.opacity != 1.0
+        || st.doc.layers().iter().filter(|l| l.id == id).count() != 1
+    {
+        return None;
+    }
+    Some(procraft_engine::geom::IRect::new(x as i32, y as i32, (x + w) as i32, (y + h) as i32))
+}
+
 /// What a row of a layer's options menu does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum LayerOption {
@@ -1141,6 +1221,69 @@ impl CanvasSession {
                 height,
                 layers,
             },
+        }
+    }
+
+    /// Requires an already settled native frame. Does not finish a stroke,
+    /// render queued work, restore parked pixels or change the document.
+    pub fn read_editable_paint_region(
+        &self,
+        layer_id: u64,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<EditablePaintRegion> {
+        let st = self.shared.lock();
+        let rect = editable_paint_rect(&st, layer_id, x, y, width, height)?;
+        let (canvas, gpu) = (st.canvas.as_ref()?, st.gpu.as_ref()?);
+        let rgba = canvas.read_editable_region(gpu, LayerId(layer_id), rect).ok()?;
+        if rgba.len() != width as usize * height as usize * 4
+            || rgba.as_chunks::<4>().0.iter().any(|p| p[..3].iter().any(|c| *c > p[3]))
+        {
+            return None;
+        }
+        Some(EditablePaintRegion {
+            canvas_id: canvas.id(),
+            revision: st.edits(),
+            layer_version: canvas.layer_version(LayerId(layer_id)),
+            layer_id,
+            canvas_width: st.doc.width(),
+            canvas_height: st.doc.height(),
+            x,
+            y,
+            width,
+            height,
+            rgba,
+        })
+    }
+
+    /// Rechecks native identity, revision, selection, format and bytes under
+    /// one state lock. The GPU stages the write and undo before admission.
+    pub fn commit_editable_paint_region(&self, base: EditablePaintRegion, replacement: Vec<u8>) -> EditablePaintCommit {
+        let reject = |reason: &str| EditablePaintCommit::Rejected { reason: reason.into() };
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let Some(rect) = editable_paint_rect(st, base.layer_id, base.x, base.y, base.width, base.height) else {
+            return reject("unsupported or busy paint target");
+        };
+        if st.edits() != base.revision || (st.doc.width(), st.doc.height()) != (base.canvas_width, base.canvas_height) {
+            return reject("stale native revision or extent");
+        }
+        let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
+            return reject("no native canvas");
+        };
+        let id = LayerId(base.layer_id);
+        if canvas.id() != base.canvas_id || canvas.layer_version(id) != base.layer_version {
+            return reject("foreign or stale native layer");
+        }
+        match canvas.commit_editable_region(gpu, id, rect, &base.rgba, &replacement) {
+            Ok(false) => EditablePaintCommit::Unchanged { revision: st.edits() },
+            Ok(true) => {
+                self.shared.frame(st);
+                EditablePaintCommit::Changed { revision: st.edits() }
+            }
+            Err(e) => EditablePaintCommit::Rejected { reason: e.to_string() },
         }
     }
 
