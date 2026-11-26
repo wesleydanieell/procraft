@@ -690,6 +690,14 @@ pub enum LiveCompositeReadback {
     AwaitingInput,
 }
 
+/// Atomic independent root paint layers, ordered bottom to top. Each image
+/// is the native compositing pass over transparency, including live stroke.
+pub enum LivePaintLayersReadback {
+    Ready { receipt: CompositeReceipt, layers: Vec<(LayerId, Vec<u8>)> },
+    Pending,
+    AwaitingInput,
+}
+
 /// Canvas-local composite identity, independent of native history steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompositeReceipt {
@@ -9911,6 +9919,112 @@ impl Canvas {
         self.read_composite(gpu).map(LiveCompositeReadback::Ready)
     }
 
+    /// Restricted independent root paint-layer extraction. Do not change
+    /// visibility, mutate history or reuse the document composite as scratch.
+    /// Reject backdrop-dependent semantics before starting any readback.
+    pub fn capture_live_paint_layers(
+        &mut self,
+        gpu: &Gpu,
+        doc: &mut Document,
+    ) -> Result<LivePaintLayersReadback, GpuError> {
+        let eligible = |canvas: &Self, doc: &Document| {
+            let count = doc.layers().iter().filter(|l| l.visible).count() as u64;
+            let bytes = u64::from(canvas.width) * u64::from(canvas.height) * 4;
+            !doc.background_visible
+                && doc.animation.is_none()
+                && doc.solo.is_none()
+                && doc.icc.is_none()
+                && !doc.profile.is_p3()
+                && doc.layers().len() <= 64
+                && bytes > 0
+                && bytes <= 4_000_000
+                && canvas.width <= 4096
+                && canvas.height <= 4096
+                && bytes * count <= 16 * 1024 * 1024
+                && (doc.width(), doc.height()) == (canvas.width, canvas.height)
+                && doc.layers().iter().all(|l| {
+                    l.kind == LayerKind::Paint
+                        && l.parent.is_none()
+                        && !l.clipped
+                        && l.blend == BlendMode::Normal
+                        && l.opacity == 1.0
+                        && !l.drawn_from_data()
+                })
+        };
+        if !eligible(self, doc) {
+            return Err(GpuError::Readback("unsupported independent paint layer scope or budget".into()));
+        }
+        self.render(gpu, doc, None);
+        if gpu.is_lost() {
+            return Err(GpuError::Lost);
+        }
+        if self.busy() || !self.ops.is_empty() || !self.dirty.is_empty() {
+            return Ok(LivePaintLayersReadback::Pending);
+        }
+        if self.smudge.as_ref().is_some_and(|s| !s.pending.is_empty()) {
+            return Ok(LivePaintLayersReadback::AwaitingInput);
+        }
+        if !eligible(self, doc) || doc.layers().iter().any(|l| l.visible && !self.layers.contains_key(&l.id)) {
+            return Err(GpuError::Readback("independent layer unavailable after render".into()));
+        }
+        let count = doc.layers().iter().filter(|l| l.visible).count();
+        let mut layers = Vec::with_capacity(count as usize);
+        // Only one scratch texture, reused in queue order. Normal source-over
+        // never asks for the second texture. Readback completes before reuse.
+        gpu.checked(|| -> Result<(), GpuError> {
+            if count > 0 {
+                let scratch = texture(&gpu.device, "live paint layer", self.width, self.height, LAYER_FORMAT);
+                let view = scratch.create_view(&wgpu::TextureViewDescriptor::default());
+                let second = OnDemand::new("live paint layer second", self.width, self.height, LAYER_FORMAT);
+                let stack = Stack { first: (&scratch, &view), second: Second::OnDemand(&second, &gpu.device) };
+                for layer in doc.layers().iter().filter(|l| l.visible) {
+                    let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("live independent paint layer"),
+                    });
+                    let mut uniforms = UniformData::default();
+                    drop(render_pass(
+                        &mut encoder,
+                        "layer clear",
+                        &view,
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    ));
+                    let mut current = 0;
+                    self.composite_layer(
+                        &gpu.device,
+                        doc,
+                        &mut encoder,
+                        &mut uniforms,
+                        self.full(),
+                        layer,
+                        Look::PLAIN,
+                        CLIP_NONE,
+                        &stack,
+                        &mut current,
+                    );
+                    #[cfg(test)]
+                    if tests::fails("live paint layer pass") {
+                        // Invalid usage on an otherwise valid scratch texture:
+                        // the later readback could otherwise succeed with stale data.
+                        encoder.copy_texture_to_texture(
+                            copy_at(&scratch, 0, 0),
+                            copy_at(&scratch, 0, 0),
+                            extent(self.width, self.height),
+                        );
+                    }
+                    self.write_uniforms(gpu, &uniforms);
+                    gpu.queue.submit([encoder.finish()]);
+                    let rgba = read_texture(gpu, &scratch, self.width, self.height)?;
+                    layers.push((layer.id, rgba));
+                }
+            }
+            Ok(())
+        })??;
+        Ok(LivePaintLayersReadback::Ready {
+            receipt: CompositeReceipt { canvas: self.id, revision: self.live_damage.revision },
+            layers,
+        })
+    }
+
     /// Read only pixels possibly changed since a caller-held complete receipt.
     /// Damage is recorded at the actual composite write, including renders outside
     /// this method. Failed reads and deferred wet passes never consume damage.
@@ -12398,6 +12512,27 @@ mod tests {
     /// Whether a texture labelled `label` is to fail on this thread.
     pub(super) fn fails(label: &str) -> bool {
         FAILING.with(|f| f.get() == Some(label))
+    }
+
+    #[test]
+    fn live_paint_layers_reject_scratch_and_render_failure() {
+        let gpu = Gpu::headless().expect("live layers require GPU");
+        let mut doc = Document::new(32, 32);
+        doc.background_visible = false;
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        canvas.render_finished(&gpu, &mut doc);
+        let capture = |canvas: &mut Canvas, doc: &mut Document| canvas.capture_live_paint_layers(&gpu, doc);
+        let before = canvas.read_composite(&gpu).unwrap();
+        let steps = canvas.steps_made();
+        for label in ["live paint layer", "live paint layer pass"] {
+            FAILING.with(|f| f.set(Some(label)));
+            let result = capture(&mut canvas, &mut doc);
+            FAILING.with(|f| f.set(None));
+            assert!(result.is_err(), "failure {label} must not publish pixels");
+            assert_eq!(canvas.steps_made(), steps);
+            assert_eq!(canvas.read_composite(&gpu).unwrap(), before);
+            assert!(matches!(capture(&mut canvas, &mut doc), Ok(LivePaintLayersReadback::Ready { .. })));
+        }
     }
 
     #[test]

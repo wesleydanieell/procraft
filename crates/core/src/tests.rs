@@ -5021,6 +5021,7 @@ fn live_composite_reports_wet_input_deferral_without_settling_the_stroke() {
         let (set, index) = st.paint_brush;
         st.library[set].brushes[index] = brush;
     }
+    s.set_background_visible(false);
     let base = match s.capture_live_composite_patch(None) {
         LiveCompositePatchCapture::Frame { patch } => patch.token,
         other => panic!("initial regional capture: {other:?}"),
@@ -5043,12 +5044,154 @@ fn live_composite_reports_wet_input_deferral_without_settling_the_stroke() {
     for _ in 0..2 {
         assert!(matches!(s.capture_live_composite_patch(Some(base.clone())), LiveCompositePatchCapture::AwaitingInput));
     }
+    for _ in 0..2 {
+        assert!(matches!(s.capture_live_paint_layers(), crate::layers::LivePaintLayersCapture::AwaitingInput));
+    }
     assert!(s.shared.lock().stroke.is_some());
     s.stroke_end(vec![]);
     assert!(matches!(capture(), LiveCompositeCapture::Frame { frame } if !frame.stroke_active));
     assert!(
+        matches!(s.capture_live_paint_layers(),crate::layers::LivePaintLayersCapture::Frame {frame} if !frame.stroke_active)
+    );
+    assert!(
         matches!(s.capture_live_composite_patch(Some(base)), LiveCompositePatchCapture::Frame { patch } if !patch.stroke_active && !patch.image.rgba.is_empty())
     );
+}
+
+#[test]
+fn live_paint_layers_recompose_native_stroke_and_preserve_history() {
+    use crate::layers::{LiveCompositeCapture, LivePaintLayersCapture, LivePaintLayersFrame};
+    let s = session(128, 128).expect("independent layer test requires real GPU");
+    fn layers(s: &CanvasSession) -> LivePaintLayersFrame {
+        for _ in 0..16 {
+            match s.capture_live_paint_layers() {
+                LivePaintLayersCapture::Frame { frame } => return frame,
+                LivePaintLayersCapture::Pending => continue,
+                other => panic!("layer capture: {other:?}"),
+            }
+        }
+        panic!("native cache never settled");
+    }
+    fn full(s: &CanvasSession) -> Vec<u8> {
+        for _ in 0..16 {
+            match s.capture_live_composite() {
+                LiveCompositeCapture::Frame { frame } => return frame.image.rgba,
+                LiveCompositeCapture::Pending => continue,
+                other => panic!("{other:?}"),
+            }
+        }
+        panic!("native cache never settled");
+    }
+    fn compare(s: &CanvasSession, f: &LivePaintLayersFrame) {
+        let mut rgba = vec![0u8; 128 * 128 * 4];
+        for l in &f.layers {
+            for (dst, src) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(l.image.rgba.as_chunks::<4>().0) {
+                for k in 0..4 {
+                    dst[k] = (u32::from(src[k]) + (u32::from(dst[k]) * (255 - u32::from(src[3])) + 127) / 255).min(255)
+                        as u8;
+                }
+            }
+        }
+        let expected = full(s);
+        // Different grouping of 8-bit blend rounding may differ by one LSB.
+        let max = rgba.iter().zip(&expected).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(max <= 1, "native composition discrepancy {max}");
+        assert_eq!(s.shared.lock().gpu.as_ref().unwrap().errors(), 0);
+    }
+    assert!(s.set_background_visible(false));
+    let bottom = s.layers()[0].id;
+    s.set_color(1., 0., 0.);
+    assert!(s.fill_layer(bottom));
+    let top = s.add_layer();
+    s.set_color(0., 0., 1.);
+    s.set_brush_size(0.18);
+    s.set_brush_opacity(0.5);
+    let before = layers(&s);
+    assert_eq!(before.layers.iter().map(|l| l.id).collect::<Vec<_>>(), vec![bottom, top]);
+    assert!(before.layers[1].image.rgba.iter().all(|v| *v == 0));
+    compare(&s, &before);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(15., 50., 100.)]);
+    s.stroke_add((1..9).map(|i| sample(15. + i as f32 * 6., 50., 100. + i as f64 * 16.)).collect());
+    let live = layers(&s);
+    assert!(live.stroke_active);
+    assert_eq!(live.revision, before.revision);
+    assert_ne!(live.token, before.token);
+    assert_eq!(live.layers[0].image, before.layers[0].image);
+    assert!(live.layers[1].image.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0 && p[3] < 255));
+    compare(&s, &live);
+    let repeated = layers(&s);
+    assert_eq!(live.token, repeated.token);
+    assert_eq!(live.revision, repeated.revision);
+    assert!(repeated.stroke_active);
+    for (a, b) in live.layers.iter().zip(&repeated.layers) {
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.image, b.image);
+        assert!(b.version >= a.version);
+    }
+    s.stroke_add(vec![sample(82., 50., 260.)]);
+    compare(&s, &layers(&s));
+    s.stroke_end(vec![]);
+    let ended = layers(&s);
+    assert!(!ended.stroke_active);
+    compare(&s, &ended);
+    s.undo();
+    let undone = layers(&s);
+    assert_eq!(undone.layers[1].image, before.layers[1].image);
+    assert_eq!(undone.layers[0].image, before.layers[0].image);
+    compare(&s, &undone);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(20., 80., 1000.)]);
+    s.stroke_add(vec![sample(60., 80., 1100.)]);
+    assert!(layers(&s).stroke_active);
+    s.stroke_cancel();
+    assert_eq!(layers(&s).layers[1].image, before.layers[1].image);
+    // Fill the top, then verify real open eraser samples and cancel.
+    s.set_color(0., 0., 1.);
+    assert!(s.fill_layer(top));
+    let filled = layers(&s);
+    s.set_tool(ToolKind::Erase);
+    s.set_brush_size(0.25);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(30., 40., 2000.)]);
+    s.stroke_add((1..9).map(|i| sample(30. + i as f32 * 6., 40., 2000. + i as f64 * 16.)).collect());
+    let erased = layers(&s);
+    assert!(erased.stroke_active);
+    assert_ne!(erased.layers[1].image, filled.layers[1].image);
+    compare(&s, &erased);
+    s.stroke_cancel();
+    assert_eq!(layers(&s).layers[1].image, filled.layers[1].image);
+    assert!(s.set_layer_visible(top, false));
+    let hidden = layers(&s);
+    assert_eq!(hidden.layers.len(), 1);
+    assert_eq!(hidden.layers[0].id, bottom);
+    compare(&s, &hidden);
+}
+
+#[test]
+fn live_paint_layers_fail_closed_for_unsupported_scope() {
+    use crate::layers::LivePaintLayersCapture as C;
+    let s = session(32, 32).expect("independent layer test requires real GPU");
+    let rejected = || assert!(matches!(s.capture_live_paint_layers(), C::Unavailable { .. }));
+    rejected(); // visible native background not yet expressible as independent root
+    assert!(s.set_background_visible(false));
+    let base = s.layers()[0].id;
+    let top = s.add_layer();
+    assert!(s.set_layer_opacity(top, 0.5, true));
+    rejected();
+    assert!(s.set_layer_opacity(top, 1., true));
+    assert!(s.set_layer_blend(top, procraft_engine::document::BlendMode::Multiply.id()));
+    rejected();
+    assert!(s.set_layer_blend(top, procraft_engine::document::BlendMode::Normal.id()));
+    assert!(s.set_layer_clipped(top, true));
+    rejected();
+    assert!(s.set_layer_clipped(top, false));
+    assert!(s.set_solo(Some(base)));
+    rejected();
+    assert!(s.set_solo(None));
+    s.add_mask(top).expect("mask");
+    rejected();
+    // Unprepared and oversized sessions never return a fabricated frame.
+    for session in [CanvasSession::new(32, 32), CanvasSession::new(2048, 2048)] {
+        assert!(matches!(session.capture_live_paint_layers(), C::Unavailable { .. }));
+    }
 }
 
 #[test]

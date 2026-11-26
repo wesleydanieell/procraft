@@ -137,6 +137,33 @@ pub enum LiveCompositePatchCapture {
     Unavailable { reason: String },
 }
 
+/// A full-size isolated native layer, not an editable replacement for it.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct LivePaintLayer {
+    pub id: u64,
+    /// Conservative invalidator; can advance without any change in pixels.
+    pub version: u64,
+    pub image: ThumbnailImage,
+}
+
+/// All visible eligible root layers from a single native render/lock.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct LivePaintLayersFrame {
+    pub token: LiveCompositeToken,
+    pub revision: u64,
+    pub stroke_active: bool,
+    pub width: u32,
+    pub height: u32,
+    pub layers: Vec<LivePaintLayer>,
+}
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum LivePaintLayersCapture {
+    Frame { frame: LivePaintLayersFrame },
+    Pending,
+    AwaitingInput,
+    Unavailable { reason: String },
+}
+
 /// What a row of a layer's options menu does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum LayerOption {
@@ -1048,6 +1075,71 @@ impl CanvasSession {
                 revision: st.edits(),
                 layer_versions,
                 stroke_active: st.stroke.is_some(),
+            },
+        }
+    }
+
+    /// Capture eligible independent paint roots under one state lock. A
+    /// transparent sRGB document with normal full-opacity roots is the first
+    /// supported subset. Refuse effects/other document types, not flatten them.
+    pub fn capture_live_paint_layers(&self) -> LivePaintLayersCapture {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let (width, height) = (st.doc.width(), st.doc.height());
+        if st.closed
+            || st.scene.is_some()
+            || st.plugin_artwork.is_some()
+            || st.plugin_opened.is_some()
+            || st.text_edit.is_some()
+            || st.transform.is_some()
+            || st.adjusting
+            || st.liquify_open()
+            || st.shape.is_some()
+            || st.pending_doc.is_some()
+            || st.feather_base.is_some()
+            || st.selection_before.is_some()
+            || st.pour.is_some()
+            || st.reveal.is_some()
+            || st.recolor.is_some()
+            || !st.unreadable.is_empty()
+            || !st.pending_pixels.is_empty()
+            || !st.pending_stores.is_empty()
+        {
+            return LivePaintLayersCapture::Unavailable { reason: "unsupported native document or interaction".into() };
+        }
+        let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
+            return LivePaintLayersCapture::Unavailable { reason: "offscreen canvas not prepared".into() };
+        };
+        let (receipt, layers) = match canvas.capture_live_paint_layers(gpu, &mut st.doc) {
+            Ok(procraft_gpu::LivePaintLayersReadback::Ready { receipt, layers }) => (receipt, layers),
+            Ok(procraft_gpu::LivePaintLayersReadback::Pending) => return LivePaintLayersCapture::Pending,
+            Ok(procraft_gpu::LivePaintLayersReadback::AwaitingInput) => return LivePaintLayersCapture::AwaitingInput,
+            Err(err) => return LivePaintLayersCapture::Unavailable { reason: err.to_string() },
+        };
+        if (st.doc.width(), st.doc.height()) != (width, height)
+            || layers.iter().any(|(_, rgba)| {
+                rgba.len() as u64 != u64::from(width) * u64::from(height) * 4
+                    || rgba.as_chunks::<4>().0.iter().any(|p| p[..3].iter().any(|c| *c > p[3]))
+            })
+        {
+            return LivePaintLayersCapture::Unavailable { reason: "invalid independent layer readback".into() };
+        }
+        let layers = layers
+            .into_iter()
+            .map(|(id, rgba)| LivePaintLayer {
+                id: id.0,
+                version: canvas.layer_version(id),
+                image: ThumbnailImage { width, height, rgba },
+            })
+            .collect();
+        LivePaintLayersCapture::Frame {
+            frame: LivePaintLayersFrame {
+                token: LiveCompositeToken { canvas_id: receipt.canvas, composite_revision: receipt.revision },
+                revision: st.edits(),
+                stroke_active: st.stroke.is_some(),
+                width,
+                height,
+                layers,
             },
         }
     }
