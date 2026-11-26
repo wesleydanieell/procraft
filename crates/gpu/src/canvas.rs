@@ -9833,6 +9833,17 @@ impl Canvas {
         DisplayLut { bind: lut_bind(gpu, &self.pipelines.lut_layout, lut.grid as u32, &rgba), id }
     }
 
+    /// Render and read the current document-space composite, including an open stroke.
+    /// Unlike `changes_queued`, readiness here does not require a stroke to end.
+    /// A cache remake or deferred drawing work must never be returned as a current picture.
+    pub fn capture_live_composite(&mut self, gpu: &Gpu, doc: &mut Document) -> Result<Option<Vec<u8>>, GpuError> {
+        self.render(gpu, doc, None);
+        if self.busy() || !self.ops.is_empty() || !self.dirty.is_empty() {
+            return Ok(None);
+        }
+        self.read_composite(gpu).map(Some)
+    }
+
     /// The composite's pixels (premultiplied RGBA8, rows top to bottom) as last rendered: after
     /// [`Canvas::render_finished`], the picture as it is. Waits for the GPU.
     pub fn read_composite(&self, gpu: &Gpu) -> Result<Vec<u8>, GpuError> {

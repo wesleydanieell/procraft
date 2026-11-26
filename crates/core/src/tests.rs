@@ -4870,6 +4870,53 @@ fn text_is_edited_as_one_step_and_rasterized() {
 }
 
 #[test]
+fn live_composite_receipts_preserve_open_stroke_and_native_undo() {
+    use crate::layers::{LiveCompositeCapture, LiveCompositeFrame};
+    let Some(s) = session(64, 64) else { return };
+    fn frame(s: &CanvasSession) -> LiveCompositeFrame {
+        for _ in 0..16 {
+            match s.capture_live_composite() {
+                LiveCompositeCapture::Frame { frame } => return frame,
+                LiveCompositeCapture::Pending => continue,
+                LiveCompositeCapture::Unavailable { reason } => panic!("{reason}"),
+            }
+        }
+        panic!("native cache never settled");
+    }
+    s.set_color(1.0, 0.0, 0.0);
+    s.set_brush_size(0.15);
+    let initial = frame(&s);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(8.0, 24.0, 100.0)]);
+    s.stroke_add((1..8).map(|i| sample(8.0 + i as f32 * 4.0, 24.0, 100.0 + i as f64 * 16.0)).collect());
+    let live = frame(&s);
+    assert!(live.stroke_active);
+    assert_ne!(live.image.rgba, initial.image.rgba);
+    assert_eq!(live.revision, initial.revision);
+    s.stroke_add((8..12).map(|i| sample(8.0 + i as f32 * 4.0, 24.0, 100.0 + i as f64 * 16.0)).collect());
+    let next = frame(&s);
+    assert!(next.stroke_active);
+    assert_ne!(next.image.rgba, live.image.rgba);
+    assert_ne!(next.layer_versions, live.layer_versions);
+    s.stroke_end(vec![]);
+    assert!(!frame(&s).stroke_active);
+    s.undo();
+    assert_eq!(frame(&s).image.rgba, initial.image.rgba);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(8.0, 40.0, 1000.0)]);
+    s.stroke_add(vec![sample(30.0, 40.0, 1100.0)]);
+    assert!(frame(&s).stroke_active);
+    s.stroke_cancel();
+    assert_eq!(frame(&s).image.rgba, initial.image.rgba);
+}
+
+#[test]
+fn live_composite_rejects_unprepared_or_over_budget_without_gpu() {
+    use crate::layers::LiveCompositeCapture;
+    for session in [CanvasSession::new(64, 64), CanvasSession::new(2048, 2048)] {
+        assert!(matches!(session.capture_live_composite(), LiveCompositeCapture::Unavailable { .. }));
+    }
+}
+
+#[test]
 fn the_canvas_thumbnail_is_the_picture() {
     let Some(s) = session(64, 64) else { return };
     s.set_background_color(0.0, 1.0, 0.0, true);

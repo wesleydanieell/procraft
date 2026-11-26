@@ -87,6 +87,24 @@ pub struct ThumbnailImage {
     pub rgba: Vec<u8>,
 }
 
+/// An atomic document-space picture and native receipts from the same render.
+/// Layer versions are conservative invalidators, not a stroke input sequence.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct LiveCompositeFrame {
+    pub image: ThumbnailImage,
+    pub revision: u64,
+    pub layer_versions: Vec<LayerVersion>,
+    pub stroke_active: bool,
+}
+
+/// No fallback pixels: Pending means the caller can ask again after another render.
+#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
+pub enum LiveCompositeCapture {
+    Frame { frame: LiveCompositeFrame },
+    Pending,
+    Unavailable { reason: String },
+}
+
 /// What a row of a layer's options menu does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum LayerOption {
@@ -953,6 +971,52 @@ impl CanvasSession {
             })
         })
         .is_some()
+    }
+
+    /// A bounded full-document live frame for an offscreen host. No window, export,
+    /// stroke settlement or second render between the image and its receipts.
+    /// The state lock covers render, readback and receipt construction; callers should
+    /// run this on a source worker, never the UI thread.
+    pub fn capture_live_composite(&self) -> LiveCompositeCapture {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let (width, height) = (st.doc.width(), st.doc.height());
+        if width == 0
+            || height == 0
+            || width > 4096
+            || height > 4096
+            || u64::from(width) * u64::from(height) > 1_000_000
+        {
+            return LiveCompositeCapture::Unavailable { reason: "document exceeds live readback budget".into() };
+        }
+        let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
+            return LiveCompositeCapture::Unavailable { reason: "offscreen canvas not prepared".into() };
+        };
+        let rgba = match canvas.capture_live_composite(gpu, &mut st.doc) {
+            Ok(Some(rgba)) => rgba,
+            Ok(None) => return LiveCompositeCapture::Pending,
+            Err(err) => return LiveCompositeCapture::Unavailable { reason: err.to_string() },
+        };
+        if (st.doc.width(), st.doc.height()) != (width, height)
+            || rgba.len() as u64 != u64::from(width) * u64::from(height) * 4
+        {
+            return LiveCompositeCapture::Unavailable { reason: "document extent changed during render".into() };
+        }
+        let layer_versions = st
+            .doc
+            .layers()
+            .iter()
+            .filter(|l| l.kind != LayerKind::Group)
+            .map(|l| LayerVersion { id: l.id.0, version: canvas.layer_version(l.id) })
+            .collect();
+        LiveCompositeCapture::Frame {
+            frame: LiveCompositeFrame {
+                image: ThumbnailImage { width, height, rgba },
+                revision: st.edits(),
+                layer_versions,
+                stroke_active: st.stroke.is_some(),
+            },
+        }
     }
 
     /// The whole picture scaled to fit `max_side` pixels (premultiplied), for the reference
