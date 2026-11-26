@@ -10249,6 +10249,126 @@ impl Canvas {
             .collect()
     }
 
+    /// Bounded raw edit port for idle, resident, plain paint layers. Never
+    /// restore a parked layer or settle an interaction implicitly.
+    fn editable_region_ready(&self, id: LayerId, rect: IRect) -> bool {
+        self.width <= 4096
+            && self.height <= 4096
+            && u64::from(self.width) * u64::from(self.height) <= 1_000_000
+            && !rect.is_empty()
+            && rect.intersect(self.full()) == rect
+            && !self.changes_queued()
+            && !self.busy()
+            && self.selection.is_none()
+            && self.held.is_none()
+            && self.mark.is_none()
+            && self.transforming.is_none()
+            && self.transform_more.is_empty()
+            && self.filter_run.is_none()
+            && self.liquify.is_none()
+            && self.smudge.is_none()
+            && self.play_frame.is_none()
+            && self.stores.is_empty()
+            && self.layers.contains_key(&id)
+    }
+
+    /// Raw original premultiplied RGBA8, not a composited receipt.
+    pub fn read_editable_region(&self, gpu: &Gpu, id: LayerId, rect: IRect) -> Result<Vec<u8>, GpuError> {
+        if !self.editable_region_ready(id, rect) {
+            return Err(GpuError::Readback("raw region not ready or unsupported".into()));
+        }
+        gpu.checked(|| self.read_layer_part(gpu, id, rect))?
+    }
+
+    /// Stage a replacement layer and its regional native undo snapshot without
+    /// touching the live texture. Only after checked GPU work AND exact
+    /// readback succeeds does the native history/texture swap take effect.
+    /// Full texture copy is a bounded V1 tradeoff, not zero-copy editing.
+    pub fn commit_editable_region(
+        &mut self,
+        gpu: &Gpu,
+        id: LayerId,
+        rect: IRect,
+        before: &[u8],
+        after: &[u8],
+    ) -> Result<bool, GpuError> {
+        let expected = u64::from(rect.width()) * u64::from(rect.height());
+        if !self.editable_region_ready(id, rect)
+            || expected > 1_000_000
+            || before.len() != expected as usize * 4
+            || after.len() != before.len()
+            || before
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(after.as_chunks::<4>().0)
+                .any(|(a, b)| a[3] != b[3] || a[..3].iter().any(|c| *c > a[3]) || b[..3].iter().any(|c| *c > b[3]))
+        {
+            return Err(GpuError::Readback("invalid raw color edit".into()));
+        }
+        if self.read_editable_region(gpu, id, rect)? != before {
+            return Err(GpuError::Readback("stale raw region".into()));
+        }
+        if before == after {
+            return Ok(false);
+        }
+        let source = &self.layers[&id].texture;
+        let (replacement, view, undo) = gpu.checked(|| -> Result<_, GpuError> {
+            let device = &gpu.device;
+            let replacement = texture(device, "staged raw edit", self.width, self.height, LAYER_FORMAT);
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("stage raw edit") });
+            let undo = region_copy(device, &mut encoder, source, rect);
+            encoder.copy_texture_to_texture(
+                copy_at(source, 0, 0),
+                copy_at(&replacement, 0, 0),
+                extent(self.width, self.height),
+            );
+            #[cfg(test)]
+            if tests::fails("editable region staging") {
+                encoder.copy_texture_to_texture(
+                    copy_at(&replacement, 0, 0),
+                    copy_at(&replacement, 0, 0),
+                    extent(self.width, self.height),
+                );
+            }
+            gpu.queue.submit([encoder.finish()]);
+            gpu.queue.write_texture(
+                copy_at(&replacement, rect.x0, rect.y0),
+                after,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(rect.width() * 4),
+                    rows_per_image: Some(rect.height()),
+                },
+                extent(rect.width(), rect.height()),
+            );
+            gpu.queue.submit(std::iter::empty());
+            let observed = start_reading_part(gpu, &replacement, rect).pixels()?;
+            let saved = read_texture(gpu, &undo, rect.width(), rect.height())?;
+            if observed != after || saved != before {
+                return Err(GpuError::Readback("staged write or undo snapshot mismatch".into()));
+            }
+            let view = replacement.create_view(&wgpu::TextureViewDescriptor::default());
+            Ok((replacement, view, undo))
+        })??;
+        self.push_step(Step {
+            made: 0,
+            name: Some("Raster region colors".into()),
+            doc: None,
+            pixels: vec![Snapshot::on_gpu(id, rect, undo)],
+            selection: None,
+            flip: None,
+            stores: Vec::new(),
+        });
+        self.layers.insert(id, LayerGpu { texture: replacement, view });
+        self.parked.remove(&id);
+        self.pictures.remove(&id);
+        self.touched(id);
+        self.invalidate();
+        Ok(true)
+    }
+
     /// A layer's pixels inside `rect` (on the canvas), rows top to bottom; none if it is off the
     /// canvas. Waits for the GPU.
     pub fn read_layer_part(&self, gpu: &Gpu, id: LayerId, rect: IRect) -> Result<Vec<u8>, GpuError> {
@@ -12512,6 +12632,42 @@ mod tests {
     /// Whether a texture labelled `label` is to fail on this thread.
     pub(super) fn fails(label: &str) -> bool {
         FAILING.with(|f| f.get() == Some(label))
+    }
+
+    #[test]
+    fn editable_region_staged_failure_preserves_live_pixels_and_history() {
+        let gpu = Gpu::headless().expect("raw edit requires GPU");
+        let mut doc = Document::new(32, 32);
+        let id = doc.current();
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        let original = [25, 50, 75, 128].repeat(32 * 32);
+        canvas.upload_layer(&gpu, id, &original).unwrap();
+        canvas.render_finished(&gpu, &mut doc);
+        let rect = IRect::new(3, 4, 18, 19);
+        let before = canvas.read_editable_region(&gpu, id, rect).unwrap();
+        let replacement = [103, 78, 53, 128].repeat(15 * 15);
+        let steps = canvas.steps_made();
+        let version = canvas.layer_version(id);
+        for label in ["staged raw edit", "editable region staging"] {
+            FAILING.with(|f| f.set(Some(label)));
+            let result = canvas.commit_editable_region(&gpu, id, rect, &before, &replacement);
+            FAILING.with(|f| f.set(None));
+            assert!(result.is_err(), "{label} must reject");
+            assert_eq!(canvas.steps_made(), steps);
+            assert_eq!(canvas.layer_version(id), version);
+            assert_eq!(canvas.read_layer(&gpu, id).unwrap(), original);
+        }
+        assert!(canvas.commit_editable_region(&gpu, id, rect, &before, &replacement).unwrap());
+        canvas.render_finished(&gpu, &mut doc);
+        let after = canvas.read_layer(&gpu, id).unwrap();
+        assert_eq!(canvas.steps_made(), steps + 1);
+        for (i, p) in after.as_chunks::<4>().0.iter().enumerate() {
+            let inside = (3..18).contains(&(i % 32)) && (4..19).contains(&(i / 32));
+            assert_eq!(*p, if inside { [103, 78, 53, 128] } else { [25, 50, 75, 128] });
+        }
+        canvas.undo();
+        canvas.render_finished(&gpu, &mut doc);
+        assert_eq!(canvas.read_layer(&gpu, id).unwrap(), original);
     }
 
     #[test]
